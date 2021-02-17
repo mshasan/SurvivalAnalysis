@@ -1,26 +1,25 @@
 #rm(list=ls())
 
+# load necessary libraries for this simulation
 library(survival)       # for survival analysis
 library(tidyverse)      # for data manipulation and analysis
 library(multidplyr)     # for parallel computing
 library(parallel)       # for finding number of cores
 
 #===============================================================================
-# This function simulate a single dataset for given parameters,
-# then fit Cox proportional hazards regression and compute statistics
 
-data_and_analysis <- function(hr=.80,        # default hazard ratio treatment vs. control
-                              n0=100,        # default sample size for control
-                              n1=50,         # default sample size treatment
-                              dropr = .05,   # default dropout rate in percentage
-                              meddrop=12,    # default median dropout time in months
-                              etime = 24,    # default enrollment time in months
-                              atime = 42,    # default final analysis time in months
-                              medsurv0 = 36) # default median survival time in months for control
+data_and_analysis <- function(hr = .80,        # default hazard ratio treatment vs. control
+                              n0 = 100,        # default sample size for control
+                              n1 = 50,         # default sample size for treatment
+                              dropr = .05,     # default dropout rate in percentage
+                              meddrop = 12,    # default median dropout time in months
+                              etime = 24,      # default enrollment time in months
+                              atime = 42,      # default final analysis time in months
+                              medsurv0 = 36)   # default median survival time in months for control
 {
   n = n0 + n1
   
-  # calculate rate for control and treatment from median survival time
+  # calculate rate for the control and treatment from median survival time
   lambda0 = log(2)/medsurv0
   medsurv1 = medsurv0/hr
   lambda1 = log(2)/medsurv1
@@ -38,6 +37,7 @@ data_and_analysis <- function(hr=.80,        # default hazard ratio treatment vs
   
   dat <- bind_cols(t0=t0, td=td, t1=t1, arm=arm)       
   
+  # fit survival model and obtain summary
   fit = survival::coxph(Surv(time, status) ~ arm, data = dat) %>% summary()
   
   # estimate true HR and 80% and 90% upper confidence interval
@@ -45,29 +45,29 @@ data_and_analysis <- function(hr=.80,        # default hazard ratio treatment vs
   uCi80 = exp(fit$coefficients[1] + qnorm(.90)*fit$coefficients[3])
   uCi90 = exp(fit$coefficients[1] + qnorm(.95)*fit$coefficients[3])
   
-  # logical output of estimated true HR > .80
+  # logical output (1, 0) if estimated true HR > .80
   pHR = as.numeric(estHR > .80)
   
-  # logical output of upper limit if CI below 1.0 
+  # logical output (1, 0) if the upper limit of CI below 1.0 
   puCi80 = as.numeric(uCi80 < 1.0)
   puCi90 = as.numeric(uCi90 < 1.0)
   
-  # logical output of rejecting hypothesis (H0: HR=1) 
+  # logical output (1, 0) if null hypothesis (H0: HR=1) is rejected
   pPval80 = as.numeric(fit$coefficients[5] < .20)
   pPval90 = as.numeric(fit$coefficients[5] < .10)
   
-  # keeping simulated data as well as statistics
-  return(list(data=tibble(arm=arm, status=status, time=time),
-              stat=tibble(trueHR=hr, n0=n0, n1=n1, n=n, estHR=estHR, pHR=pHR, 
+  # keeping simulated data as well as statistics in a nested structure
+  return(list(data = tibble(arm=arm, status=status, time=time),
+              stat = tibble(trueHR=hr, n0=n0, n1=n1, n=n, estHR=estHR, pHR=pHR, 
                           puCi80=puCi80, puCi90=puCi90,
                           pPval80=pPval80, pPval90=pPval90)))
 }
 
-#===============================================================================
-# This function simulate datasets for the combinations of hr, n0, and n1;
-# for each iteration then obtain the same output as the function 'data_and_analysis' does
 
-power_by_HR_N <- function(iter,                  # no of default iteration
+
+#===============================================================================
+
+power_by_HR_N <- function(iter,                  # number of iterations
                           hr = c(.65, .70, .80), 
                           n0 = 350,  
                           n1 = c(30, 60, 90),   
@@ -78,32 +78,32 @@ power_by_HR_N <- function(iter,                  # no of default iteration
                           medsurv0 = 36) 
   
 {
-  # find combinations of hr, n0, and n1; then apply function to obtain statistics,
-  # then only extract only statistics (stat) from the results
+  # find combinations of hr, n0, and n1; apply function to obtain statistics,
+  # then only extract statistics (stat) from the results
   comboFit <- expand_grid(hr, n0, n1) %>%
-    mutate(results=pmap(., data_and_analysis)) %>%
-    .$results %>%
-    map_dfr('stat') 
-  
+                  mutate(results=pmap(., data_and_analysis)) 
   return(comboFit)
 }
 
 
 #===============================================================================
-# multiple core - parallel computation
-cl <- detectCores()
+# setup multiple core for parallel computation
+cl <- detectCores() # automatically detect the number of cores
+cl
 cluster <- new_cluster(cl)
 
-# include R-libraries and functions to be use to the cluster
+# include R-libraries and functions to be used to the cluster
 cluster_library(cluster, c("tidyverse", "survival", "dplyr"))
 cluster_copy(cluster, c('power_by_HR_N', 'data_and_analysis'))
 
 
 # apply functions using multiple cores
 set.seed(1212021)
+
 # Start the clock!
 ptm <- proc.time()
-iter=5000
+
+iter=10
 d <- bind_cols(iterVal = 1:iter)
 
 iter_result <- d %>% 
@@ -111,20 +111,21 @@ iter_result <- d %>%
   partition(cluster) %>%
   mutate(output = map(iterVal, 
                       ~power_by_HR_N(iter=., 
-                                     hr = c(.65, .90, .90, 1.0, 1.1, 1.5),           
-                                     n0 = 350,  
-                                     n1 = seq(50, 100, 10)))) %>%
-  collect()
+                                     hr = c(.65, .90, 1.0, 1.1, 1.5),           
+                                     n0 = c(250, 350),  
+                                     n1 = c(100, 200, 300)))) %>% collect()
+
 proc.time() - ptm
 # End the clock!
 
 
 # summarize the output
 final_result <- iter_result %>% 
-  unnest(cols=output) %>%
-  group_by(trueHR, n0, n1, n) %>%
-  summarise_all(mean, na.rm=TRUE)
-
+                  unnest(cols=output) %>%
+                  .$results %>%
+                  map_dfr('stat') %>%
+                  group_by(trueHR, n0, n1, n) %>%
+                  summarise_all(mean, na.rm=TRUE)
 
 
 #===============================================================================
@@ -137,14 +138,24 @@ iter=5000
 d <- bind_cols(iterVal = 1:iter)
 
 iter_resultx <- d %>% 
-  group_by(iterVal) %>%
-  mutate(output = map(iterVal, 
-                      ~power_by_HR_N(iter=., 
-                                     hr = c(.65, .90, .90, 1.0, 1.1, 1.5),           
-                                     n0 = 350,  
-                                     n1 = seq(50, 100, 10)))) 
+                  group_by(iterVal) %>%
+                  mutate(output = map(iterVal, 
+                                      ~power_by_HR_N(iter=., 
+                                                     hr = c(.65, .90, 1.0, 1.1, 1.5),           
+                                                     n0 = c(250, 350),  
+                                                     n1 = c(100, 200, 300)))) 
 proc.time() - ptm
 # End the clock!
+
+
+# summarize the output
+final_resultx <- iter_result %>% 
+                  unnest(cols=output) %>%
+                  .$results %>%
+                  map_dfr('stat') %>%
+                  group_by(trueHR, n0, n1, n) %>%
+                  summarise_all(mean, na.rm=TRUE)
+
 #===============================================================================
 
 
