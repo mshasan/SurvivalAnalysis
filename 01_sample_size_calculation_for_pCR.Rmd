@@ -1,0 +1,197 @@
+---
+title: Sample size simulation for pathological complete response (pCR) rate
+date: "`r Sys.Date()`"
+output:
+  html_document: default
+  word_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Background
+
+We are interested in determining the required sample size for achieving certain power for given pCR rates. In Bayesian context, this can be translated to the required sample size to obtain the probability that the lower credible interval (CrI) of the estimated pCR rate exceeds prespecified hurdle cutoffs of pCR. The goal of this simulation is to utilize both frequentist and Bayesian approaches. Define true pCR and estimted pCR are $pCR$ and $\hat {pCR}$, respectively; observed participants with pCR is $m$, sample size $n$, hurdle cutoff is $p_0$. Furthermore, for the Bayesian approach, the sample size simulation utilizes $Beta (0.5, 0.5)$ and $Beta (0.5+m, 0.5+n-m)$ as the prior and the posterior distribution for the pCR rate. In summary, we want to simulate probability (proportion) of $P(\hat {pCR} > p_0 ~|~ pCR) > (1-\alpha/2)$ under the various combination of the true $pCR = \{.15, .30, .40, .55\}$, sample size $n = \{30, 50, 60, 70, 100\}$, hurdle cutoffs $p_0 = \{.20, .25, .30, .40, .45\}$ and false positive rate $\alpha = \{.20, .40\}$ over $5000$ iterations. In addition, we also want to obtain $P(\hat {pCR} < p_0 ~|~ pCR) > (1-\alpha/2)$ to determine futility probability if an interim analysis is performed. Note that, the sample size determination is based on the success criteria, therefore, no additional computation is necessary to determine early success probability of the interim analysis.   
+
+In the above scenario, we need to simulate $4\times 5\times 5\times 2\times 5000 = 1,000,000$ datasets to obtain the probability estimates., which is very time-consuming. Therefore, we will conduct the simulation by taking advantage of modern multicore computers. The R-code below shows the steps of parallel computing and we accomplish this in three steps:
+
+  i) Define a function that simulates a single dataset, performs analysis, and return the corresponding statistics.
+  ii) Define another function that performs step (i) for the different combinations of the parameters: `pCR, n, p0` and `alpha`.
+  iii) Finally, apply function using multiple cores to perform parallel computing.
+
+
+```{r loadlibraries, message=FALSE, warning=FALSE}
+#rm(list=ls())
+
+# load necessary libraries for this simulation
+library(tidyverse)      # for data manipulation and analysis
+library(multidplyr)     # for parallel computing
+library(parallel)       # for finding the number of cores
+library(DT)             # for interactive tables
+```
+
+i\) The function `data_and_analysis` simulates a single dataset for the given parameters then performs analysis and computes the corresponding statistics. The inputs of this function are different population parameters and the output is a `tibble`of computed statistics. We take advantage of `tidyverse` nested data structure to keep statistics in a nicer format.
+
+```{r functionSimulateSingleDataset, message=FALSE, warning=FALSE}
+#===============================================================================
+
+data_and_analysis <- function(pCR = 0.30,   # default true pCR rate
+                              p0 = 0.20,    # default hurdle cutoffs comparing estimated pCR rate with
+                              n = 60,       # default sample size 
+                              alpha = 0.20) # False positive rate      
+{
+  b1 = b2 = 0.5    # parameters of beta prior 
+  m = 0:n          # observed number of participants 
+
+  #Obtaining the lest number of observed participants needed to obtain >(1-alpha/2)        
+  #probability of having estimated pCR rate is greater than the given hurdle cutoff p0 
+  m_th = bind_cols(m = m, p = pbeta(p0, b1+m, b2+n-m, lower.tail = FALSE)) %>% 
+          mutate(pgt = p>(1-alpha/2)) %>%
+          filter(pgt==TRUE) %>%
+          slice_head() %>% 
+          select('m') %>%
+          as.numeric()
+  
+  # out1-out4 below are different ways of obtaining the logical outcomes,
+  # consequently obtaining probabilities using all iterations of simulation
+  
+  # Checking (TRUE/FALSE) whether sum of samples (0, 1) exceeds m_th number
+  out1 = sample(x=c(0, 1), size=n, prob=c(1-pCR, pCR), replace=TRUE) %>%
+            sum() >= m_th
+  
+  # generate binomial sample, calculate P(estPCR > p0|pCR), then compare whether
+  # this is greater than the (1-alpha/2)
+  x = rbinom(n=1, size=n, prob=pCR) 
+  out2 = pbeta(p0, b1+x, b2+n-x, lower.tail = FALSE) > (1-alpha/2)
+  
+  # conduct one-sample proportion tests for H0:pCR<=p0 vs. H1:pCR>p0,
+  # then compare pvalue with Type I error (alpha) 
+  out3 = prop.test(x=x, n=n, conf.level=1-alpha/2, p=p0, 
+                   alternative="greater", correct=TRUE)$p.value < alpha/2
+
+  # perform normal-approximation similar to out2
+  a = b1+x
+  b = b2+n-x
+  out4 = pnorm(p0, mean=a/(a+b), sd=sqrt((a*b)/((a+b+1)*(a+b)^2)), 
+               lower.tail = FALSE) > (1-alpha/2)
+  
+  # futility probability P(phat <= p0) is greater than (1-alpha/2)
+  futility = pbeta(p0, b1+x, b2+n-x) > (1-alpha/2)
+
+  # keeping statistics in a nested structure
+  return(stat = tibble(reqSubj = m_th,
+                       reqSubjBinom = x,
+                       sampleBased=out1,
+                       binomBased=out2,
+                       ptestBased=out3,
+                       normalBased=out4,
+                       futility = futility))
+}
+```
+
+ii\) The function `power_by_combo` simulates datasets for the different combinations of `pCR, n, p0` and `alpha` for each iteration then obtain the same output as the function `data_and_analysis` does. It is possible to include iteration within this function, however, our target is to split iterations over different cores to reduce the computational and transitional time.
+
+
+```{r functionSimulateMultipleDatasets, message=FALSE, warning=FALSE}
+#===============================================================================
+
+power_by_combo <- function(iter,                  # number of iterations
+                         pCR = c(.15, .30, .40, .55),
+                         p0 = c(.20, .25, .30, .40, .45),
+                         n = c(30, 50, 60, 70, 100),
+                         alpha = c(.2, .4)) 
+  
+{
+  # find combinations of pCR, n, p0, and alpha; then apply function to obtain statistics
+  comboFit <- expand_grid(pCR, n, p0, alpha) %>%
+                  mutate(results=pmap(., data_and_analysis)) 
+  return(comboFit)
+}
+```
+
+iii\) Now, we apply the functions using multiple cores to obtain the results.
+
+```{r setupMultiCore, message=FALSE, warning=FALSE}
+#===============================================================================
+# setup multiple core for parallel computation
+cl <- detectCores() # automatically detect the number of cores
+cl
+cluster <- new_cluster(cl)
+
+# include R-libraries and functions to be used to the cluster
+cluster_library(cluster, c("tidyverse", "dplyr"))
+cluster_copy(cluster, c('power_by_combo', 'data_and_analysis'))
+```
+
+
+
+```{r applyMultiCore, message=FALSE, warning=FALSE}
+# apply functions using multiple cores
+set.seed(616)
+
+# Start the clock!
+ptm <- proc.time()
+
+iter=5000
+d <- bind_cols(iterVal = 1:iter)
+
+iter_result <- d %>% 
+  group_by(iterVal) %>%
+  partition(cluster) %>%
+  mutate(output = map(iterVal, 
+                      ~power_by_combo(iter=., 
+                                     pCR = c(.15, .30, .40, .55),
+                                     p0 = c(.20, .25, .30, .40, .45),
+                                     n = c(30, 50, 60, 70, 100),
+                                     alpha = c(.2, .4)))) %>% collect()
+
+ptm_mc <- proc.time() - ptm
+ptm_mc
+# End the clock!
+```
+
+This shows the amount of time needed if we use multiple cores.
+
+```{r iterationResults, message=FALSE, warning=FALSE}
+iter_result
+```
+The `tidyverse` nested output is very unique. The first column `iterVal` is the index of iterations and the second column `output` is the list in which each row contains a `tibble` of $200$ rows and $5$ columns. The $200$ rows represent the combination of `pCR, n, p0` and `alpha` and the $5$ columns represent `pCR, n, p0, alpha` and `results`. The `results` then contains a list of seven statistics `m_th` and `x`, `out1 - out4`, and `futility`, which refer to `reqSubj, reqSubjBinom, sampleBased, binomBased, ptestBased, normalBased`, and `futility`, respectively. The details can be obtained by running the code below `final_result` step by step. Here we are interested in the final statistics, which is obtained by using all steps of `final_result`. The final result is obtained by taking mean over iterations. Since the output is very long, we display the results using an interactive table.  
+
+```{r summaryResults, message=FALSE, warning=FALSE}
+# summarize the output
+final_result <- iter_result %>% 
+                  unnest(cols=output) %>%
+                  unnest(cols=results) %>%
+                  group_by(pCR, n, p0, alpha) %>%
+                  summarise_all(mean, na.rm=TRUE)
+
+# Create interactive table
+final_result %>%
+  select(-'iterVal') %>% 
+  mutate_if(is.numeric, round, 2) %>%
+  mutate(reqSubjBinom=ceiling(reqSubjBinom)) %>%
+  DT::datatable(extensions = 'Buttons',
+            options = list(dom = 'Blfrtip',
+                           buttons = c('copy', 'csv', 'excel', 'pdf', 'print'),
+                           lengthMenu = list(c(10, 25, 50, -1),
+                                             c(10, 25, 50, "All"))))
+```
+
+
+## Remarks
+
+The columns `pCR, p0, n` and `alpha` are the true pCR rate, hurdle cutoffs, sample size, and false-positive rate (Type I error), respectively; the next two columns are the required participants needed to obtain $>90\%$, i.e., $>(1-\alpha/2)$, probability using sample-based and binomial random variable based approaches, respectively; the remaining five columns are the proportion of estimated `pCR` rate that is greater than `p0` for the different combination of `pCR, n` and `alpha` except the `futility` column. The `futility` is the proportion of estimated `pCR` rate less than `p0` for the different parameter combinations. Additionally, `sampleBased` and `binomBased` utilized the Bayesian approach, and `ptestBased`, and `normalBased`utilized the frequentist approach, thus appropriate to say probability and power, respectively.     
+
+If the true pCR rate is $40\%$, $100$ participants will provide over $90\%$ probability or if the true pCR rate is $30\%$, $60$ participants will provide about $65\%$ probability to have the lower limit of the $80\%$ CrI exceeding $20\%$ hurdle pCR rate.
+
+If an interim analysis is planned after $50$ participants and true pCR rate is greater than $55\%$, then an early success may be declared with $71\%$ certainty if we want to be the posterior probability of pCR rate $>45\%$ `(=p0)` is greater than $80\%$, i.e., at $(\alpha=.40)$. That is, at least $26$ subjects with pCR are required. 
+
+Similarly, if an interim analysis is planned after $30$ participants and true pCR rate is less than $15\%$, then futility may be declared with $72\%$ certainty if the posterior probability of pCR rate $<25\%$ is greater than $80\%$. That is, $5$ or fewer subjects are required with pCR.
+
+
+
+
+
+
+
